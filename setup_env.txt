@@ -1,0 +1,31 @@
+环境配置步骤（PowerShell，UTF-8）：
+
+1) 确认 Python 可用并版本合适（建议 3.10+）：
+   python --version
+
+2) 临时放开当前会话的执行策略（如未启用脚本执行时需要）：
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+3) 在项目根目录创建并激活虚拟环境：
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   # 激活后提示符前会出现 (.venv)
+
+4) 升级 pip：
+   python -m pip install --upgrade pip
+
+5) 安装项目依赖（requirements.txt 准备好后优先使用）：
+   # 推荐
+   pip install -r requirements.txt
+   # 如暂未生成 requirements.txt，可临时安装核心包：
+   pip install ultralytics opencv-python-headless numpy gradio pyyaml tqdm pytest black ruff
+
+6) 验证安装（可选）：
+   python -c "import ultralytics, cv2, numpy as np; print('ok')"
+   pytest -q
+
+7) 后续启动/使用前，记得先激活虚拟环境：
+   .\.venv\Scripts\Activate.ps1
+
+8) 完成后退出虚拟环境（可选）：
+   deactivate

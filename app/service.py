@@ -1,0 +1,264 @@
+"""Service orchestrating baseline and enhanced pipelines."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+import cv2
+import numpy as np
+
+from core.config import JobConfig
+from core.detector_yolo import Detection, YoloDetector
+from core.export import (
+    export_config,
+    export_detections_json,
+    export_image,
+    export_summary_json,
+)
+from core.tiling import remap_box_xyxy, tile_image
+from core.traffic_light_state import classify_traffic_light_state
+from core.utils import ensure_dir, new_job_id, setup_logger
+from core.visualize import draw_detections
+from core.wbf import weighted_boxes_fusion
+
+
+class Service:
+    """Pipeline service for processing images."""
+
+    def __init__(self, output_root: Path | str = "outputs") -> None:
+        self.output_root = Path(output_root)
+        self.detector = YoloDetector()
+        self._loaded = False
+
+    def _ensure_detector(self, device: str) -> None:
+        if not self._loaded:
+            self.detector.load(device=device)
+            self._loaded = True
+
+    def run_job(
+        self,
+        image: Any,
+        config: JobConfig | None = None,
+        device: str = "cpu",
+    ) -> dict:
+        """Run baseline and enhanced pipelines, write outputs, and return paths."""
+        cfg = config or JobConfig()
+        load_ms = 0.0
+        if not self._loaded:
+            t_load = time.perf_counter()
+            self._ensure_detector(device)
+            load_ms = (time.perf_counter() - t_load) * 1000
+        else:
+            self._ensure_detector(device)
+        job_id = new_job_id()
+        job_dir = ensure_dir(self.output_root / job_id)
+        logger = setup_logger(job_dir / "run.log")
+        logger.info("Job start %s on device=%s", job_id, device)
+
+        image_bgr = self._to_bgr(image)
+        h, w = image_bgr.shape[:2]
+
+        warmup_ms = 0.0
+        warmup_ran = False
+        if not self.detector.warmed_up:
+            t_warm = time.perf_counter()
+            _ = self.detector.detect(
+                image_bgr=image_bgr,
+                conf_threshold=cfg.conf_threshold,
+                nms_iou=cfg.nms_iou,
+                max_det=cfg.max_det,
+            )
+            warmup_ms = (time.perf_counter() - t_warm) * 1000
+            self.detector.warmed_up = True
+            warmup_ran = True
+
+        # Baseline
+        t0 = time.perf_counter()
+        t_base_infer = time.perf_counter()
+        dets_baseline = self.detector.detect(
+            image_bgr=image_bgr,
+            conf_threshold=cfg.conf_threshold,
+            nms_iou=cfg.nms_iou,
+            max_det=cfg.max_det,
+        )
+        baseline_global_infer_ms = (time.perf_counter() - t_base_infer) * 1000
+        dets_baseline = self._attach_traffic_light_states(image_bgr, dets_baseline)
+        t_base_vis = time.perf_counter()
+        baseline_img = draw_detections(image_bgr, dets_baseline)
+        baseline_vis_ms = (time.perf_counter() - t_base_vis) * 1000
+        t_base_export = time.perf_counter()
+        export_image(job_dir / "baseline_boxed.png", baseline_img)
+        num_params = self.detector.num_parameters()
+        export_detections_json(
+            job_dir / "baseline.json",
+            job_id=job_id,
+            pipeline="baseline",
+            model_name="yolov8n",
+            num_parameters=num_params,
+            image_shape=(h, w),
+            config=cfg,
+            detections=dets_baseline,
+        )
+        baseline_export_ms = (time.perf_counter() - t_base_export) * 1000
+        baseline_ms = (time.perf_counter() - t0) * 1000
+
+        # Enhanced
+        t1 = time.perf_counter()
+        t_global = time.perf_counter()
+        dets_global = self.detector.detect(
+            image_bgr=image_bgr,
+            conf_threshold=cfg.conf_threshold,
+            nms_iou=cfg.nms_iou,
+            max_det=cfg.max_det,
+        )
+        global_infer_ms = (time.perf_counter() - t_global) * 1000
+        dets_tiles: list[Detection] = []
+        tiles = tile_image(image_bgr, tile_size=cfg.tile_size, overlap=cfg.overlap)
+        tile_infer_ms_total = 0.0
+        for tile, x0, y0 in tiles:
+            t_tile = time.perf_counter()
+            tile_dets = self.detector.detect(
+                image_bgr=tile,
+                conf_threshold=cfg.conf_threshold,
+                nms_iou=cfg.nms_iou,
+                max_det=cfg.max_det,
+            )
+            tile_infer_ms_total += (time.perf_counter() - t_tile) * 1000
+            for det in tile_dets:
+                remapped_box = remap_box_xyxy(det.box_xyxy, x0, y0)
+                dets_tiles.append(
+                    Detection(
+                        label=det.label,
+                        class_id=det.class_id,
+                        score=det.score,
+                        box_xyxy=remapped_box,
+                        attrs={},
+                    )
+                )
+        dets_all = list(dets_global) + dets_tiles
+        dets_enhanced = weighted_boxes_fusion(dets_all, iou_thresh=cfg.wbf_iou)
+        dets_enhanced = self._attach_traffic_light_states(image_bgr, dets_enhanced)
+        t_enh_vis = time.perf_counter()
+        enhanced_img = draw_detections(image_bgr, dets_enhanced)
+        enhanced_vis_ms = (time.perf_counter() - t_enh_vis) * 1000
+        t_enh_export = time.perf_counter()
+        export_image(job_dir / "enhanced_boxed.png", enhanced_img)
+        export_detections_json(
+            job_dir / "enhanced.json",
+            job_id=job_id,
+            pipeline="enhanced",
+            model_name="yolov8n",
+            num_parameters=num_params,
+            image_shape=(h, w),
+            config=cfg,
+            detections=dets_enhanced,
+        )
+        enhanced_export_ms = (time.perf_counter() - t_enh_export) * 1000
+        enhanced_ms = (time.perf_counter() - t1) * 1000
+
+        # Shared exports
+        t_export = time.perf_counter()
+        export_config(job_dir / "config.json", cfg)
+        export_summary_json(
+            job_dir / "summary.json",
+            job_id=job_id,
+            device=device,
+            baseline_ms=baseline_ms,
+            enhanced_ms=enhanced_ms,
+            baseline_num_boxes=len(dets_baseline),
+            enhanced_num_boxes=len(dets_enhanced),
+            num_parameters_total=num_params,
+            notes={
+                "tiling": len(tiles) > 1,
+                "wbf": True,
+                "global_fallback": True,
+            },
+            model_load_ms=load_ms,
+            num_tiles=len(tiles),
+            tile_infer_ms_total=tile_infer_ms_total,
+            global_infer_ms=global_infer_ms,
+            export_ms=(time.perf_counter() - t_export) * 1000,
+            baseline_global_infer_ms=baseline_global_infer_ms,
+            baseline_vis_ms=baseline_vis_ms,
+            baseline_export_ms=baseline_export_ms,
+            enhanced_vis_ms=enhanced_vis_ms,
+            enhanced_export_ms=enhanced_export_ms,
+            enhanced_global_infer_ms=global_infer_ms,
+            x_starts=sorted({x0 for _, x0, _ in tiles}),
+            y_starts=sorted({y0 for _, _, y0 in tiles}),
+            warmup_ms=warmup_ms,
+            warmup_ran=warmup_ran,
+        )
+
+        logger.info(
+            "Job %s done. Baseline %.1f ms (%d boxes), Enhanced %.1f ms (%d boxes)",
+            job_id,
+            baseline_ms,
+            len(dets_baseline),
+            enhanced_ms,
+            len(dets_enhanced),
+        )
+        logger.debug(
+            "Job %s tiling detail: num_tiles=%d x_starts=%s y_starts=%s",
+            job_id,
+            len(tiles),
+            sorted({x0 for _, x0, _ in tiles}),
+            sorted({y0 for _, _, y0 in tiles}),
+        )
+
+        return {
+            "job_id": job_id,
+            "output_dir": str(job_dir),
+            "baseline_image": str(job_dir / "baseline_boxed.png"),
+            "enhanced_image": str(job_dir / "enhanced_boxed.png"),
+            "baseline_json": str(job_dir / "baseline.json"),
+            "enhanced_json": str(job_dir / "enhanced.json"),
+            "summary_json": str(job_dir / "summary.json"),
+            "config_json": str(job_dir / "config.json"),
+            "baseline_ms": baseline_ms,
+            "enhanced_ms": enhanced_ms,
+        }
+
+    def _to_bgr(self, image: Any) -> np.ndarray:
+        """Convert input (PIL/np) to BGR uint8."""
+        if image is None:
+            raise ValueError("Input image is None")
+        if isinstance(image, np.ndarray):
+            arr = image
+        else:
+            try:
+                from PIL import Image
+            except ImportError as exc:
+                raise ValueError("Unsupported image type and PIL not available") from exc
+            if isinstance(image, Image.Image):
+                arr = np.array(image)
+            else:
+                raise ValueError(f"Unsupported image type: {type(image)}")
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"Invalid image shape: {arr.shape}")
+        if arr.dtype != np.uint8:
+            arr = arr.astype(np.uint8)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    def _attach_traffic_light_states(
+        self, image_bgr: np.ndarray, detections: Iterable[Detection]
+    ) -> list[Detection]:
+        result: list[Detection] = []
+        for det in detections:
+            attrs = dict(det.attrs)
+            if det.label == "traffic light":
+                attrs["state"] = classify_traffic_light_state(image_bgr, det.box_xyxy)
+            result.append(
+                Detection(
+                    label=det.label,
+                    class_id=det.class_id,
+                    score=det.score,
+                    box_xyxy=det.box_xyxy,
+                    attrs=attrs,
+                )
+            )
+        return result

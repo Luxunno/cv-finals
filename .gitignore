@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pdb
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Local outputs / artifacts
+outputs/
+reports/
+
+# Large local datasets / patches
+data/
+filter/patches/
+
+# Model weights / caches
+*.pt
+*.onnx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
