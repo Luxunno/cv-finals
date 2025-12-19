@@ -64,3 +64,5 @@ def test_export_jsons(tmp_path):
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
             assert data
+            if name == "config.json":
+                assert "effective_config" in data

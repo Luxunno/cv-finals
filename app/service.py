@@ -11,13 +11,14 @@ import numpy as np
 
 from core.config import JobConfig
 from core.detector_yolo import Detection, YoloDetector
+from core.postprocess import nms
 from core.export import (
     export_config,
     export_detections_json,
     export_image,
     export_summary_json,
 )
-from core.tiling import remap_box_xyxy, tile_image
+from core.tiling import box_center_in_region, tile_image_padded
 from core.traffic_light_state import classify_traffic_light_state
 from core.utils import ensure_dir, new_job_id, setup_logger
 from core.visualize import draw_detections
@@ -79,7 +80,7 @@ class Service:
         t_base_infer = time.perf_counter()
         dets_baseline = self.detector.detect(
             image_bgr=image_bgr,
-            conf_threshold=cfg.conf_threshold,
+            conf_threshold=cfg.global_conf_threshold,
             nms_iou=cfg.nms_iou,
             max_det=cfg.max_det,
         )
@@ -109,36 +110,84 @@ class Service:
         t_global = time.perf_counter()
         dets_global = self.detector.detect(
             image_bgr=image_bgr,
-            conf_threshold=cfg.conf_threshold,
+            conf_threshold=cfg.global_conf_threshold,
             nms_iou=cfg.nms_iou,
             max_det=cfg.max_det,
         )
         global_infer_ms = (time.perf_counter() - t_global) * 1000
         dets_tiles: list[Detection] = []
-        tiles = tile_image(image_bgr, tile_size=cfg.tile_size, overlap=cfg.overlap)
+        tiles, x_starts, y_starts = tile_image_padded(
+            image_bgr,
+            tile_size=cfg.tile_size,
+            overlap=cfg.overlap,
+            pad_px=cfg.tile_pad_px,
+        )
         tile_infer_ms_total = 0.0
-        for tile, x0, y0 in tiles:
+        for tile in tiles:
+            crop_bgr = tile.crop_bgr
+            if cfg.tile_scale and cfg.tile_scale != 1.0:
+                crop_bgr = cv2.resize(
+                    crop_bgr,
+                    None,
+                    fx=cfg.tile_scale,
+                    fy=cfg.tile_scale,
+                    interpolation=cv2.INTER_LINEAR,
+                )
             t_tile = time.perf_counter()
             tile_dets = self.detector.detect(
-                image_bgr=tile,
-                conf_threshold=cfg.conf_threshold,
+                image_bgr=crop_bgr,
+                conf_threshold=cfg.tile_conf_threshold,
                 nms_iou=cfg.nms_iou,
                 max_det=cfg.max_det,
             )
             tile_infer_ms_total += (time.perf_counter() - t_tile) * 1000
+
             for det in tile_dets:
-                remapped_box = remap_box_xyxy(det.box_xyxy, x0, y0)
+                x1, y1, x2, y2 = det.box_xyxy
+                if cfg.tile_scale and cfg.tile_scale != 1.0:
+                    x1 = int(round(x1 / cfg.tile_scale))
+                    y1 = int(round(y1 / cfg.tile_scale))
+                    x2 = int(round(x2 / cfg.tile_scale))
+                    y2 = int(round(y2 / cfg.tile_scale))
+                gx1 = x1 + tile.crop_x0
+                gy1 = y1 + tile.crop_y0
+                gx2 = x2 + tile.crop_x0
+                gy2 = y2 + tile.crop_y0
+
+                gx1 = max(0, min(gx1, w - 1))
+                gy1 = max(0, min(gy1, h - 1))
+                gx2 = max(0, min(gx2, w - 1))
+                gy2 = max(0, min(gy2, h - 1))
+                if gx2 <= gx1 or gy2 <= gy1:
+                    continue
+
+                if not box_center_in_region(
+                    (gx1, gy1, gx2, gy2),
+                    tile.eff_x0,
+                    tile.eff_y0,
+                    tile.eff_x1,
+                    tile.eff_y1,
+                ):
+                    continue
+
                 dets_tiles.append(
                     Detection(
                         label=det.label,
                         class_id=det.class_id,
                         score=det.score,
-                        box_xyxy=remapped_box,
+                        box_xyxy=(int(gx1), int(gy1), int(gx2), int(gy2)),
                         attrs={},
                     )
                 )
         dets_all = list(dets_global) + dets_tiles
-        dets_enhanced = weighted_boxes_fusion(dets_all, iou_thresh=cfg.wbf_iou)
+        dets_enhanced = weighted_boxes_fusion(
+            dets_all,
+            iou_thresh=cfg.wbf_iou_normal,
+            small_area_thresh=cfg.small_area_thresh,
+            iou_small=cfg.wbf_iou_small,
+            iou_normal=cfg.wbf_iou_normal,
+        )
+        dets_enhanced = nms(dets_enhanced, iou_thresh=cfg.nms_iou)
         dets_enhanced = self._attach_traffic_light_states(image_bgr, dets_enhanced)
         t_enh_vis = time.perf_counter()
         enhanced_img = draw_detections(image_bgr, dets_enhanced)
@@ -160,7 +209,7 @@ class Service:
 
         # Shared exports
         t_export = time.perf_counter()
-        export_config(job_dir / "config.json", cfg)
+        export_config(job_dir / "config.json", cfg, device=device)
         export_summary_json(
             job_dir / "summary.json",
             job_id=job_id,
@@ -186,10 +235,14 @@ class Service:
             enhanced_vis_ms=enhanced_vis_ms,
             enhanced_export_ms=enhanced_export_ms,
             enhanced_global_infer_ms=global_infer_ms,
-            x_starts=sorted({x0 for _, x0, _ in tiles}),
-            y_starts=sorted({y0 for _, _, y0 in tiles}),
+            x_starts=x_starts,
+            y_starts=y_starts,
             warmup_ms=warmup_ms,
             warmup_ran=warmup_ran,
+            tile_pad_px=cfg.tile_pad_px,
+            tile_scale=cfg.tile_scale,
+            global_conf_threshold=cfg.global_conf_threshold,
+            tile_conf_threshold=cfg.tile_conf_threshold,
         )
 
         logger.info(
@@ -204,8 +257,8 @@ class Service:
             "Job %s tiling detail: num_tiles=%d x_starts=%s y_starts=%s",
             job_id,
             len(tiles),
-            sorted({x0 for _, x0, _ in tiles}),
-            sorted({y0 for _, _, y0 in tiles}),
+            x_starts,
+            y_starts,
         )
 
         return {

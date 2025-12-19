@@ -17,7 +17,7 @@ import dataclasses
 import json
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import gradio as gr
 from PIL import Image, ImageDraw
@@ -64,19 +64,32 @@ def _filter_to_six(dets: list[dict], only_six: bool) -> list[dict]:
 
 
 def build_config_from_ui(
-    conf_threshold: float,
+    global_conf_threshold: float,
     tile_size: int,
     overlap: float,
-    wbf_iou: float,
+    wbf_iou_normal: float,
     max_det: int,
+    *,
+    tile_conf_threshold: float,
+    tile_pad_px: int,
+    tile_scale: float,
+    wbf_iou_small: float,
+    small_area_thresh: int,
 ) -> JobConfig:
     base = JobConfig()
     return dataclasses.replace(
         base,
-        conf_threshold=float(conf_threshold),
+        conf_threshold=float(global_conf_threshold),
+        global_conf_threshold=float(global_conf_threshold),
+        tile_conf_threshold=float(tile_conf_threshold),
         tile_size=int(tile_size),
         overlap=float(overlap),
-        wbf_iou=float(wbf_iou),
+        tile_pad_px=int(tile_pad_px),
+        tile_scale=float(tile_scale),
+        wbf_iou=float(wbf_iou_normal),
+        wbf_iou_normal=float(wbf_iou_normal),
+        wbf_iou_small=float(wbf_iou_small),
+        small_area_thresh=int(small_area_thresh),
         max_det=int(max_det),
     )
 
@@ -94,16 +107,34 @@ def _config_snapshot_from_ui(cfg: JobConfig, device: str) -> dict:
     }
 
 
-def _load_effective_config(job_dir: Path) -> tuple[Optional[dict], Optional[Path]]:
+def _load_effective_config(job_dir: Path) -> tuple[Optional[dict], Optional[dict], Optional[dict], Optional[Path]]:
     cfg_path = job_dir / "config.json"
     if not cfg_path.exists():
-        return None, None
-    return _load_json(cfg_path), cfg_path
+        return None, None, None, None
+    data = _load_json(cfg_path)
+    if "effective_config" in data or "full_config" in data:
+        effective = data.get("effective_config")
+        full = data.get("full_config")
+        deprecated_mismatch = data.get("deprecated_mismatch")
+        return effective, full, deprecated_mismatch, cfg_path
+    # Backward-compatible: config.json is flat
+    return data, data, {}, cfg_path
 
 
 def _compare_config(ui_snapshot: dict, effective: dict) -> list[str]:
     mismatches: list[str] = []
-    keys = ["conf_threshold", "tile_size", "overlap", "wbf_iou", "max_det"]
+    keys = [
+        "global_conf_threshold",
+        "tile_conf_threshold",
+        "tile_size",
+        "overlap",
+        "tile_pad_px",
+        "tile_scale",
+        "wbf_iou_normal",
+        "wbf_iou_small",
+        "small_area_thresh",
+        "max_det",
+    ]
     for k in keys:
         if k not in effective:
             mismatches.append(f"{k}: missing in config.json")
@@ -163,28 +194,34 @@ def _match_diff(
             reverse=True,
         )
         b_used = [False] * len(b_list)
+        e_used = [False] * len(e_list)
 
-        for e in e_list:
+        for e_idx, e in enumerate(e_list):
             e_box = e.get("box_xyxy")
-            best_iou = 0.0
+            best_iou_all = 0.0
+            best_iou_unused = 0.0
             best_idx = -1
 
             if isinstance(e_box, list) and len(e_box) == 4:
                 for idx, b in enumerate(b_list):
-                    if b_used[idx]:
-                        continue
                     b_box = b.get("box_xyxy")
                     if not (isinstance(b_box, list) and len(b_box) == 4):
                         continue
                     iou = iou_xyxy(tuple(map(float, e_box)), tuple(map(float, b_box)))
-                    if iou > best_iou:
-                        best_iou = iou
+                    best_iou_all = max(best_iou_all, iou)
+                    if b_used[idx]:
+                        continue
+                    if iou > best_iou_unused:
+                        best_iou_unused = iou
                         best_idx = idx
 
-            e["iou_match"] = best_iou
-            if best_iou >= diff_iou_thresh and best_idx >= 0:
+            # For Added: show best IoU against any baseline (even matched)
+            e["iou_match"] = best_iou_all
+            if best_iou_unused >= diff_iou_thresh and best_idx >= 0:
                 b_used[best_idx] = True
-                b_list[best_idx]["iou_match"] = best_iou
+                e_used[e_idx] = True
+                b_list[best_idx]["iou_match"] = best_iou_unused
+                e["iou_match"] = best_iou_unused
                 matched.append((b_list[best_idx], e))
             else:
                 added.append(e)
@@ -195,7 +232,9 @@ def _match_diff(
             b_box = b.get("box_xyxy")
             best_iou = 0.0
             if isinstance(b_box, list) and len(b_box) == 4:
-                for e in e_list:
+                for e_idx, e in enumerate(e_list):
+                    if e_used[e_idx]:
+                        continue
                     e_box = e.get("box_xyxy")
                     if not (isinstance(e_box, list) and len(e_box) == 4):
                         continue
@@ -305,6 +344,11 @@ def run_job_ui(
     wbf_iou: float,
     diff_iou_thresh: float,
     max_det: int,
+    tile_conf_threshold: float,
+    tile_pad_px: int,
+    tile_scale: float,
+    wbf_iou_small: float,
+    small_area_thresh: int,
 ) -> tuple[
     Optional[str],
     Optional[str],
@@ -333,7 +377,18 @@ def run_job_ui(
 
     image_rgb = Image.open(src).convert("RGB")
     svc = Service()
-    cfg = build_config_from_ui(conf_threshold, tile_size, overlap, wbf_iou, max_det)
+    cfg = build_config_from_ui(
+        conf_threshold,
+        tile_size,
+        overlap,
+        wbf_iou,
+        max_det,
+        tile_conf_threshold=tile_conf_threshold,
+        tile_pad_px=tile_pad_px,
+        tile_scale=tile_scale,
+        wbf_iou_small=wbf_iou_small,
+        small_area_thresh=small_area_thresh,
+    )
 
     ui_snapshot = _config_snapshot_from_ui(cfg, device)
     discarded_dir = ""
@@ -349,7 +404,7 @@ def run_job_ui(
     summary = _load_json(summary_path) if summary_path.exists() else {}
 
     # Validate config actually effective
-    effective_cfg, cfg_path = _load_effective_config(job_dir)
+    effective_cfg, full_cfg, deprecated_mismatch, cfg_path = _load_effective_config(job_dir)
     ui_cfg_snapshot_path = None
     if effective_cfg is None:
         ui_cfg_snapshot_path = job_dir / "ui_config_snapshot.json"
@@ -431,17 +486,21 @@ def run_job_ui(
     advanced = {
         "ui_snapshot": ui_snapshot,
         "effective_config_json": effective_cfg,
+        "full_config_json": full_cfg,
+        "deprecated_mismatch": deprecated_mismatch,
         "mismatches": mismatches,
         "discarded_output_dir": discarded_dir,
     }
 
     status = "运行成功"
     if mismatches:
-        status = (
-            "**[ERROR] 参数未生效：**\n"
-            + "\n".join([f"- {m}" for m in mismatches])
-            + "\n\n请检查 build_config_from_ui 或 service 导出逻辑。"
-        )
+        status = "**[ERROR] 参数未生效：**\n" + "\n".join([f"- {m}" for m in mismatches])
+        if deprecated_mismatch:
+            status += (
+                "\n\n**[ERROR] Deprecated 不同步：**\n"
+                + "\n".join([f"- {k}: {v}" for k, v in (deprecated_mismatch or {}).items()])
+            )
+        status += "\n\n请检查 build_config_from_ui 或 service 导出逻辑。"
 
     status += "\n\n" + _warn_text(summary, discard_first=run_twice_discard_first)
 
@@ -483,27 +542,58 @@ def build_interface() -> gr.Blocks:
                 run_twice = gr.Checkbox(value=True, label="Run twice (discard first)")
 
         with gr.Row():
-            conf_threshold = gr.Slider(0.05, 0.25, step=0.01, value=0.25, label="conf_threshold")
+            profile = gr.Radio(choices=["Fast", "Balanced", "Quality", "Custom"], value="Balanced", label="Profile")
+            conf_threshold = gr.Slider(0.05, 0.25, step=0.01, value=0.25, label="conf_threshold (global)")
             tile_size = gr.Dropdown([384, 512, 640, 768], value=640, label="tile_size")
             overlap = gr.Slider(0.1, 0.4, step=0.01, value=0.2, label="overlap")
-            wbf_iou = gr.Slider(0.5, 0.7, step=0.01, value=0.55, label="wbf_iou")
+            wbf_iou = gr.Slider(0.45, 0.7, step=0.01, value=0.58, label="wbf_iou_normal")
             diff_iou_thresh = gr.Slider(0.3, 0.7, step=0.01, value=0.5, label="diff_iou_thresh")
             max_det = gr.Slider(50, 300, step=10, value=300, label="max_det")
 
-        with gr.Row():
-            preset_a = gr.Button("Preset A")
-            preset_b = gr.Button("Preset B")
-            run_btn = gr.Button("Run", variant="primary")
+        with gr.Accordion("Advanced parameters", open=False):
+            tile_conf_threshold = gr.Slider(0.05, 0.3, step=0.01, value=0.18, label="tile_conf_threshold")
+            tile_pad_px = gr.Slider(0, 96, step=4, value=48, label="tile_pad_px")
+            tile_scale = gr.Dropdown([1.0, 1.5, 2.0], value=1.0, label="tile_scale")
+            wbf_iou_small = gr.Slider(0.3, 0.55, step=0.01, value=0.45, label="wbf_iou_small")
+            small_area_thresh = gr.Slider(256, 4096, step=128, value=1024, label="small_area_thresh")
 
-        preset_a.click(
-            fn=lambda: (0.20, 512, 0.20, 0.58, 0.50),
-            inputs=[],
-            outputs=[conf_threshold, tile_size, overlap, wbf_iou, diff_iou_thresh],
-        )
-        preset_b.click(
-            fn=lambda: (0.23, 640, 0.18, 0.62, 0.50),
-            inputs=[],
-            outputs=[conf_threshold, tile_size, overlap, wbf_iou, diff_iou_thresh],
+        run_btn = gr.Button("Run", variant="primary")
+
+        def apply_profile(p: str):
+            if p == "Fast":
+                return 0.25, 640, 0.18, 0.62, 0.5, 0.20, 32, 1.0, 0.45, 1024
+            if p == "Balanced":
+                return 0.25, 512, 0.20, 0.58, 0.5, 0.18, 48, 1.0, 0.45, 1024
+            if p == "Quality":
+                return 0.25, 512, 0.20, 0.58, 0.5, 0.16, 64, 1.5, 0.45, 1024
+            return (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+
+        profile.change(
+            fn=apply_profile,
+            inputs=[profile],
+            outputs=[
+                conf_threshold,
+                tile_size,
+                overlap,
+                wbf_iou,
+                diff_iou_thresh,
+                tile_conf_threshold,
+                tile_pad_px,
+                tile_scale,
+                wbf_iou_small,
+                small_area_thresh,
+            ],
         )
 
         with gr.Row():
@@ -558,6 +648,11 @@ def build_interface() -> gr.Blocks:
             wi: float,
             diou: float,
             mdmax: int,
+            tconf: float,
+            tpad: int,
+            tscale: float,
+            wbf_small: float,
+            sath: int,
         ):
             try:
                 return run_job_ui(
@@ -572,6 +667,11 @@ def build_interface() -> gr.Blocks:
                     wi,
                     diou,
                     mdmax,
+                    tconf,
+                    tpad,
+                    tscale,
+                    wbf_small,
+                    sath,
                 )
             except Exception as exc:  # noqa: BLE001
                 return (
@@ -609,6 +709,11 @@ def build_interface() -> gr.Blocks:
                 wbf_iou,
                 diff_iou_thresh,
                 max_det,
+                tile_conf_threshold,
+                tile_pad_px,
+                tile_scale,
+                wbf_iou_small,
+                small_area_thresh,
             ],
             outputs=[
                 baseline_img,

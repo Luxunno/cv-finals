@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -30,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Custom dataset benchmark for small object recall@0.5")
     parser.add_argument("--device", default="cpu", help='Device string, default "cpu"')
     parser.add_argument(
+        "--profile",
+        choices=["fast", "balanced", "quality"],
+        default="balanced",
+        help="Config profile: fast|balanced|quality",
+    )
+    parser.add_argument(
         "--images",
         default=str(ROOT / "data" / "custom" / "images"),
         help="Directory of images",
@@ -47,6 +54,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_profile(cfg: JobConfig, profile: str) -> JobConfig:
+    """Apply fixed profile parameters (must match README table)."""
+    p = profile.lower().strip()
+    if p == "fast":
+        return dataclasses.replace(
+            cfg,
+            global_conf_threshold=0.25,
+            tile_conf_threshold=0.20,
+            tile_size=640,
+            overlap=0.18,
+            tile_pad_px=32,
+            tile_scale=1.0,
+            wbf_iou_normal=0.62,
+            conf_threshold=0.25,
+            wbf_iou=0.62,
+        )
+    if p == "quality":
+        return dataclasses.replace(
+            cfg,
+            global_conf_threshold=0.25,
+            tile_conf_threshold=0.16,
+            tile_size=512,
+            overlap=0.20,
+            tile_pad_px=64,
+            tile_scale=1.5,
+            wbf_iou_normal=0.58,
+            conf_threshold=0.25,
+            wbf_iou=0.58,
+        )
+    # balanced (default)
+    return dataclasses.replace(
+        cfg,
+        global_conf_threshold=0.25,
+        tile_conf_threshold=0.18,
+        tile_size=512,
+        overlap=0.20,
+        tile_pad_px=48,
+        tile_scale=1.0,
+        wbf_iou_normal=0.58,
+        conf_threshold=0.25,
+        wbf_iou=0.58,
+    )
+
+
 def main() -> None:
     args = parse_args()
     img_dir = Path(args.images)
@@ -58,13 +109,15 @@ def main() -> None:
         raise RuntimeError(f"No images found in {img_dir}")
 
     svc = Service()
-    cfg = JobConfig()
+    cfg = apply_profile(JobConfig(), args.profile)
 
     tp_baseline = [0] * len(GT_CLASSES)
     tp_enhanced = [0] * len(GT_CLASSES)
     gt_small_total = [0] * len(GT_CLASSES)
     baseline_ms_list: list[float] = []
     enhanced_ms_list: list[float] = []
+    baseline_boxes_list: list[int] = []
+    enhanced_boxes_list: list[int] = []
 
     for img_path in image_paths:
         label_path = label_dir / (img_path.stem + ".txt")
@@ -91,6 +144,8 @@ def main() -> None:
 
         baseline_ms_list.append(float(result["baseline_ms"]))
         enhanced_ms_list.append(float(result["enhanced_ms"]))
+        baseline_boxes_list.append(len(baseline_data.get("detections", [])))
+        enhanced_boxes_list.append(len(enhanced_data.get("detections", [])))
 
     def safe_div(num: float, den: float) -> float:
         return num / den if den > 0 else 0.0
@@ -104,6 +159,10 @@ def main() -> None:
         "enhanced_recall_small@0.5": safe_div(overall_enhanced_tp, overall_gt_small),
         "delta_small_recall": safe_div(overall_enhanced_tp, overall_gt_small)
         - safe_div(overall_baseline_tp, overall_gt_small),
+        "baseline_boxes_avg": safe_div(sum(baseline_boxes_list), len(baseline_boxes_list)),
+        "enhanced_boxes_avg": safe_div(sum(enhanced_boxes_list), len(enhanced_boxes_list)),
+        "delta_boxes_avg": safe_div(sum(enhanced_boxes_list), len(enhanced_boxes_list))
+        - safe_div(sum(baseline_boxes_list), len(baseline_boxes_list)),
     }
 
     per_class = {}
@@ -119,22 +178,36 @@ def main() -> None:
         "enhanced_ms_avg": safe_div(sum(enhanced_ms_list), len(enhanced_ms_list)),
     }
 
-    config_snapshot = {
-        "conf_threshold": cfg.conf_threshold,
-        "nms_iou": cfg.nms_iou,
-        "tile_size": cfg.tile_size,
-        "overlap": cfg.overlap,
-        "wbf_iou": cfg.wbf_iou,
+    config_snapshot = cfg.effective_snapshot(device=args.device)
+    meta = {
+        "num_images": len(image_paths),
+        "image_count": len(image_paths),
+        "profile": args.profile,
+        "device": args.device,
+        "git_commit": "",
     }
 
-    meta = {"num_images": len(image_paths)}
+    try:
+        import subprocess
+
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        meta["git_commit"] = commit
+    except Exception:
+        meta["git_commit"] = ""
 
     save_eval_report(out_path, overall, per_class, runtime, config_snapshot, meta)
 
     print(f"Eval done on {len(image_paths)} images.")
-    print(f"baseline_recall_small@0.5={overall['baseline_recall_small@0.5']:.4f} "
-          f"enhanced_recall_small@0.5={overall['enhanced_recall_small@0.5']:.4f} "
-          f"delta={overall['delta_small_recall']:.4f}")
+    print(
+        f"baseline_recall_small@0.5={overall['baseline_recall_small@0.5']:.4f} "
+        f"enhanced_recall_small@0.5={overall['enhanced_recall_small@0.5']:.4f} "
+        f"delta={overall['delta_small_recall']:.4f}"
+    )
+    print(
+        f"baseline_boxes_avg={overall['baseline_boxes_avg']:.2f} "
+        f"enhanced_boxes_avg={overall['enhanced_boxes_avg']:.2f} "
+        f"delta_boxes_avg={overall['delta_boxes_avg']:.2f}"
+    )
 
 
 if __name__ == "__main__":

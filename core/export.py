@@ -43,10 +43,18 @@ def export_detections_json(
         "image": {"width": int(image_shape[1]), "height": int(image_shape[0])},
         "config": {
             "conf_threshold": config.conf_threshold,
+            "global_conf_threshold": config.global_conf_threshold,
+            "tile_conf_threshold": config.tile_conf_threshold,
             "nms_iou": config.nms_iou,
             "tile_size": config.tile_size,
             "overlap": config.overlap,
+            "tile_pad_px": config.tile_pad_px,
+            "tile_scale": config.tile_scale,
             "wbf_iou": config.wbf_iou,
+            "small_area_thresh": config.small_area_thresh,
+            "wbf_iou_small": config.wbf_iou_small,
+            "wbf_iou_normal": config.wbf_iou_normal,
+            "max_det": config.max_det,
         },
         "detections": [_detection_to_dict(det) for det in detections],
     }
@@ -80,6 +88,10 @@ def export_summary_json(
     y_starts: list[int] | None = None,
     warmup_ms: float | None = None,
     warmup_ran: bool | None = None,
+    tile_pad_px: int | None = None,
+    tile_scale: float | None = None,
+    global_conf_threshold: float | None = None,
+    tile_conf_threshold: float | None = None,
 ) -> None:
     data = {
         "job_id": job_id,
@@ -121,20 +133,25 @@ def export_summary_json(
         data["warmup_ms"] = warmup_ms
     if warmup_ran is not None:
         data["warmup_ran"] = warmup_ran
+    if tile_pad_px is not None:
+        data["tile_pad_px"] = tile_pad_px
+    if tile_scale is not None:
+        data["tile_scale"] = tile_scale
+    if global_conf_threshold is not None:
+        data["global_conf_threshold"] = global_conf_threshold
+    if tile_conf_threshold is not None:
+        data["tile_conf_threshold"] = tile_conf_threshold
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def export_config(path: Path, config: JobConfig) -> None:
+def export_config(path: Path, config: JobConfig, device: str | None = None) -> None:
     cfg = {
-        "conf_threshold": config.conf_threshold,
-        "nms_iou": config.nms_iou,
-        "tile_size": config.tile_size,
-        "overlap": config.overlap,
-        "wbf_iou": config.wbf_iou,
-        "max_det": config.max_det,
-        "img_max_side": config.img_max_side,
+        "full_config": config.to_dict(),
+        "effective_config": config.effective_snapshot(device=device),
+        "deprecated_fields": ["conf_threshold", "wbf_iou"],
+        "deprecated_mismatch": config.deprecated_mismatch(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
