@@ -38,6 +38,19 @@ class Service:
             self.detector.load(device=device)
             self._loaded = True
 
+    def _resolve_device(self, requested: str) -> tuple[str, str | None]:
+        """Return (actual_device, fallback_reason) based on availability."""
+        req = (requested or "cpu").lower()
+        if req != "cuda":
+            return req, None
+        try:
+            import torch
+        except Exception as exc:  # noqa: BLE001
+            return "cpu", f"torch import failed: {exc}"
+        if not torch.cuda.is_available():
+            return "cpu", "cuda not available"
+        return "cuda", None
+
     def run_job(
         self,
         image: Any,
@@ -46,17 +59,24 @@ class Service:
     ) -> dict:
         """Run baseline and enhanced pipelines, write outputs, and return paths."""
         cfg = config or JobConfig()
+        requested_device = device
+        actual_device, fallback_reason = self._resolve_device(requested_device)
         load_ms = 0.0
         if not self._loaded:
             t_load = time.perf_counter()
-            self._ensure_detector(device)
+            self._ensure_detector(actual_device)
             load_ms = (time.perf_counter() - t_load) * 1000
         else:
-            self._ensure_detector(device)
+            self._ensure_detector(actual_device)
         job_id = new_job_id()
         job_dir = ensure_dir(self.output_root / job_id)
         logger = setup_logger(job_dir / "run.log")
-        logger.info("Job start %s on device=%s", job_id, device)
+        logger.info(
+            "Job start %s on requested_device=%s actual_device=%s",
+            job_id,
+            requested_device,
+            actual_device,
+        )
 
         image_bgr = self._to_bgr(image)
         h, w = image_bgr.shape[:2]
@@ -209,11 +229,14 @@ class Service:
 
         # Shared exports
         t_export = time.perf_counter()
-        export_config(job_dir / "config.json", cfg, device=device)
+        export_config(job_dir / "config.json", cfg, device=actual_device)
         export_summary_json(
             job_dir / "summary.json",
             job_id=job_id,
-            device=device,
+            device=actual_device,
+            requested_device=requested_device,
+            actual_device=actual_device,
+            device_fallback_reason=fallback_reason,
             baseline_ms=baseline_ms,
             enhanced_ms=enhanced_ms,
             baseline_num_boxes=len(dets_baseline),
@@ -272,6 +295,9 @@ class Service:
             "config_json": str(job_dir / "config.json"),
             "baseline_ms": baseline_ms,
             "enhanced_ms": enhanced_ms,
+            "requested_device": requested_device,
+            "actual_device": actual_device,
+            "device_fallback_reason": fallback_reason,
         }
 
     def _to_bgr(self, image: Any) -> np.ndarray:

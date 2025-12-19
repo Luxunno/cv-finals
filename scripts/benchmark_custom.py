@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
+import random
 import sys
-import time
+import dataclasses
 from pathlib import Path
 
 from PIL import Image
@@ -22,7 +24,6 @@ from core.eval import (
     accumulate_recall_small,
     load_yolo_labels,
     map_predictions,
-    save_eval_report,
 )
 from core.io_image import imread_any
 
@@ -35,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         choices=["fast", "balanced", "quality"],
         default="balanced",
         help="Config profile: fast|balanced|quality",
+    )
+    parser.add_argument(
+        "--config_json",
+        default="",
+        help="Path to config json containing effective_config (overrides profile)",
     )
     parser.add_argument(
         "--images",
@@ -50,6 +56,18 @@ def parse_args() -> argparse.Namespace:
         "--output",
         default=str(ROOT / "reports" / "custom_eval.json"),
         help="Path to evaluation output json",
+    )
+    parser.add_argument(
+        "--subset_k",
+        type=int,
+        default=0,
+        help="Evaluate only K images (0 means full set)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for subset sampling",
     )
     return parser.parse_args()
 
@@ -98,18 +116,37 @@ def apply_profile(cfg: JobConfig, profile: str) -> JobConfig:
     )
 
 
-def main() -> None:
-    args = parse_args()
-    img_dir = Path(args.images)
-    label_dir = Path(args.labels)
-    out_path = Path(args.output)
+def _hash_dataset(image_paths: list[Path]) -> str:
+    items = [f"{p.name}|{p.stat().st_size}" for p in image_paths]
+    joined = "\n".join(items).encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()
 
-    image_paths = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"})
-    if not image_paths:
-        raise RuntimeError(f"No images found in {img_dir}")
 
+def load_config_json(path: Path) -> JobConfig:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if "effective_config" in data:
+        cfg_data = data["effective_config"]
+    else:
+        cfg_data = data
+    cfg = JobConfig()
+    updates = {key: value for key, value in cfg_data.items() if hasattr(cfg, key)}
+    cfg = dataclasses.replace(cfg, **updates)
+    if hasattr(cfg, "global_conf_threshold"):
+        cfg = dataclasses.replace(cfg, conf_threshold=cfg.global_conf_threshold)
+    if hasattr(cfg, "wbf_iou_normal"):
+        cfg = dataclasses.replace(cfg, wbf_iou=cfg.wbf_iou_normal)
+    return cfg
+
+
+def run_benchmark(
+    image_paths: list[Path],
+    label_dir: Path,
+    cfg: JobConfig,
+    device: str,
+    seed: int,
+) -> dict:
     svc = Service()
-    cfg = apply_profile(JobConfig(), args.profile)
 
     tp_baseline = [0] * len(GT_CLASSES)
     tp_enhanced = [0] * len(GT_CLASSES)
@@ -125,7 +162,7 @@ def main() -> None:
         image_np = imread_any(img_path)
         h, w = image_np.shape[:2]
 
-        result = svc.run_job(image=image, config=cfg, device=args.device)
+        result = svc.run_job(image=image, config=cfg, device=device)
         with Path(result["baseline_json"]).open("r", encoding="utf-8") as f:
             baseline_data = json.load(f)
         with Path(result["enhanced_json"]).open("r", encoding="utf-8") as f:
@@ -157,12 +194,7 @@ def main() -> None:
     overall = {
         "baseline_recall_small@0.5": safe_div(overall_baseline_tp, overall_gt_small),
         "enhanced_recall_small@0.5": safe_div(overall_enhanced_tp, overall_gt_small),
-        "delta_small_recall": safe_div(overall_enhanced_tp, overall_gt_small)
-        - safe_div(overall_baseline_tp, overall_gt_small),
-        "baseline_boxes_avg": safe_div(sum(baseline_boxes_list), len(baseline_boxes_list)),
-        "enhanced_boxes_avg": safe_div(sum(enhanced_boxes_list), len(enhanced_boxes_list)),
-        "delta_boxes_avg": safe_div(sum(enhanced_boxes_list), len(enhanced_boxes_list))
-        - safe_div(sum(baseline_boxes_list), len(baseline_boxes_list)),
+        "gain": safe_div(overall_enhanced_tp, overall_gt_small) - safe_div(overall_baseline_tp, overall_gt_small),
     }
 
     per_class = {}
@@ -177,36 +209,80 @@ def main() -> None:
         "baseline_ms_avg": safe_div(sum(baseline_ms_list), len(baseline_ms_list)),
         "enhanced_ms_avg": safe_div(sum(enhanced_ms_list), len(enhanced_ms_list)),
     }
+    runtime["latency_ratio"] = safe_div(runtime["enhanced_ms_avg"], runtime["baseline_ms_avg"])
 
-    config_snapshot = cfg.effective_snapshot(device=args.device)
-    meta = {
-        "num_images": len(image_paths),
-        "image_count": len(image_paths),
-        "profile": args.profile,
-        "device": args.device,
-        "git_commit": "",
+    boxes = {
+        "baseline_boxes_avg": safe_div(sum(baseline_boxes_list), len(baseline_boxes_list)),
+        "enhanced_boxes_avg": safe_div(sum(enhanced_boxes_list), len(enhanced_boxes_list)),
     }
+    boxes["boxes_growth"] = boxes["enhanced_boxes_avg"] - boxes["baseline_boxes_avg"]
+
+    config_snapshot = cfg.effective_snapshot(device=device)
+    meta = {
+        "image_count": len(image_paths),
+        "device": device,
+        "seed": seed,
+        "profile": "",
+        "git_commit": "",
+        "dataset_hash": _hash_dataset(image_paths),
+    }
+
+    return {
+        "overall": overall,
+        "per_class": per_class,
+        "runtime": runtime,
+        "boxes": boxes,
+        "config_snapshot": config_snapshot,
+        "meta": meta,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    img_dir = Path(args.images)
+    label_dir = Path(args.labels)
+    out_path = Path(args.output)
+
+    image_paths = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"})
+    if not image_paths:
+        raise RuntimeError(f"No images found in {img_dir}")
+
+    if args.config_json:
+        cfg = load_config_json(Path(args.config_json))
+        profile = ""
+    else:
+        cfg = apply_profile(JobConfig(), args.profile)
+        profile = args.profile
+
+    if args.subset_k and args.subset_k > 0:
+        rng = random.Random(args.seed)
+        image_paths = rng.sample(image_paths, k=min(args.subset_k, len(image_paths)))
+
+    report = run_benchmark(image_paths, label_dir, cfg, args.device, args.seed)
+    report["meta"]["profile"] = profile
 
     try:
         import subprocess
 
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        meta["git_commit"] = commit
+        report["meta"]["git_commit"] = commit
     except Exception:
-        meta["git_commit"] = ""
+        report["meta"]["git_commit"] = ""
 
-    save_eval_report(out_path, overall, per_class, runtime, config_snapshot, meta)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
 
     print(f"Eval done on {len(image_paths)} images.")
     print(
-        f"baseline_recall_small@0.5={overall['baseline_recall_small@0.5']:.4f} "
-        f"enhanced_recall_small@0.5={overall['enhanced_recall_small@0.5']:.4f} "
-        f"delta={overall['delta_small_recall']:.4f}"
+        f"baseline_recall_small@0.5={report['overall']['baseline_recall_small@0.5']:.4f} "
+        f"enhanced_recall_small@0.5={report['overall']['enhanced_recall_small@0.5']:.4f} "
+        f"gain={report['overall']['gain']:.4f}"
     )
     print(
-        f"baseline_boxes_avg={overall['baseline_boxes_avg']:.2f} "
-        f"enhanced_boxes_avg={overall['enhanced_boxes_avg']:.2f} "
-        f"delta_boxes_avg={overall['delta_boxes_avg']:.2f}"
+        f"baseline_boxes_avg={report['boxes']['baseline_boxes_avg']:.2f} "
+        f"enhanced_boxes_avg={report['boxes']['enhanced_boxes_avg']:.2f} "
+        f"boxes_growth={report['boxes']['boxes_growth']:.2f}"
     )
 
 

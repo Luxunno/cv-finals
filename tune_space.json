@@ -1,0 +1,53 @@
+{
+  "parameters": {
+    "global_conf_threshold": {
+      "type": "continuous",
+      "min": 0.2,
+      "max": 0.3,
+      "sample": "uniform"
+    },
+    "tile_conf_threshold": {
+      "type": "continuous",
+      "min": 0.12,
+      "max": 0.22,
+      "sample": "uniform"
+    },
+    "tile_size": {
+      "type": "discrete",
+      "values": [384, 512, 640, 768]
+    },
+    "overlap": {
+      "type": "continuous",
+      "min": 0.1,
+      "max": 0.35,
+      "sample": "uniform"
+    },
+    "tile_pad_px": {
+      "type": "discrete",
+      "values": [32, 48, 64]
+    },
+    "tile_scale": {
+      "type": "discrete",
+      "values": [1.0, 1.5],
+      "conditions": {
+        "profile": ["balanced", "quality"]
+      }
+    },
+    "wbf_iou_normal": {
+      "type": "continuous",
+      "min": 0.55,
+      "max": 0.65,
+      "sample": "uniform"
+    },
+    "wbf_iou_small": {
+      "type": "continuous",
+      "min": 0.4,
+      "max": 0.55,
+      "sample": "uniform"
+    },
+    "small_area_thresh": {
+      "type": "discrete",
+      "values": [1024]
+    }
+  }
+}

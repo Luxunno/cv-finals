@@ -92,6 +92,9 @@ def export_summary_json(
     tile_scale: float | None = None,
     global_conf_threshold: float | None = None,
     tile_conf_threshold: float | None = None,
+    requested_device: str | None = None,
+    actual_device: str | None = None,
+    device_fallback_reason: str | None = None,
 ) -> None:
     data = {
         "job_id": job_id,
@@ -103,6 +106,12 @@ def export_summary_json(
         "num_parameters_total": num_parameters_total,
         "notes": notes,
     }
+    if requested_device is not None:
+        data["requested_device"] = requested_device
+    if actual_device is not None:
+        data["actual_device"] = actual_device
+    if device_fallback_reason is not None:
+        data["device_fallback_reason"] = device_fallback_reason
     if model_load_ms is not None:
         data["model_load_ms"] = model_load_ms
     if num_tiles is not None:
